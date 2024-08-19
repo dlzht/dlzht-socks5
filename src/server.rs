@@ -60,7 +60,6 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, warn};
-use crate::client::{SocksClient, SocksClientBuilder};
 
 pub struct SocksServerBuilder {
     server_address: SocketAddr,
