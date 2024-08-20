@@ -58,7 +58,36 @@
 //!
 //! ### Custom validate username/password
 //!
-//! Will support soon
+//! ```
+//! use async_trait::async_trait;
+//! use dlzht_socks5::server::{PasswordAuthority, SocksServerBuilder};
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     let server = SocksServerBuilder::new()
+//!         .custom_auth_pass()
+//!         .build().unwrap();
+//!     let _ = server.start().await;
+//! }
+//!
+//! struct DatabaseAuthority {
+//!   database: Database
+//! }
+//!
+//! #[async_trait]
+//! impl PasswordAuthority for DatabaseAuthority {
+//!   async fn auth(&self, username: &[u8], password: &[u8]) -> Option<u64> {
+//!     return self.database.select("SELECT id FROM account WHERE username = #{username} AND password = #{password}")
+//!   }
+//! }
+//!
+//! struct Database;
+//! impl Database {
+//!   fn select(&self, sql: &str) -> Option<u64> {
+//!     todo!()
+//!   }
+//! }
+//! ```
 //!
 //! ### Run client without any authorization
 //! ```
