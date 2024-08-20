@@ -30,11 +30,56 @@ async fn main() {
 }
 ```
 
-#### Custom validate username/password
+### Run server with handshake timeout
 
-Will support soon
+```rust
+use std::time::Duration;
+use dlzht_socks5::server::SocksServerBuilder;
 
-#### Run client without any authorization
+#[tokio::main]
+async fn main() {
+    let server = SocksServerBuilder::new()
+        .allow_auth_skip(true)
+        .handshake_timeout(Duration::from_secs(1))
+        .build().unwrap();
+    let _ = server.start().await;
+}
+```
+
+### Custom validate username/password
+
+```rust
+use async_trait::async_trait;
+use dlzht_socks5::server::{PasswordAuthority, SocksServerBuilder};
+
+#[tokio::main]
+async fn main() {
+    let server = SocksServerBuilder::new()
+        .custom_auth_pass()
+        .build().unwrap();
+    let _ = server.start().await;
+}
+
+struct DatabaseAuthority {
+  database: Database
+}
+
+#[async_trait]
+impl PasswordAuthority for DatabaseAuthority {
+  async fn auth(&self, username: &[u8], password: &[u8]) -> Option<u64> {
+    return self.database.select("SELECT id FROM account WHERE username = #{username} AND password = #{password}")
+  }
+}
+
+struct Database;
+impl Database {
+  fn select(&self, sql: &str) -> Option<u64> {
+    todo!()
+  }
+}
+```
+
+### Run client without any authorization
 
 ```rust
 use dlzht_socks5::client::SocksClientBuilder;
@@ -75,3 +120,27 @@ async fn main() {
         .unwrap();
 }
 ```
+
+### Run client with handshake timeout
+
+```rust
+use dlzht_socks5::client::SocksClientBuilder;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+#[tokio::main]
+async fn main() {
+    use std::time::Duration;
+let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080));
+    let mut client = SocksClientBuilder::new()
+        .server_address(address)
+        .allow_auth_skip(true)
+        .handshake_timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
+    let mut stream = client
+        .connect(("127.0.0.1".to_string(), 9000))
+        .await
+        .unwrap();
+}
+```
+Default handshake timeout is 10 minutes, which almost means no timeout configured.
