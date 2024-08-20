@@ -1,8 +1,8 @@
 This library is an implement of SOCKS5, [RFC1928](https://www.rfc-editor.org/rfc/rfc1928). So far, auth method of `NO AUTHENTICATION REQUIRED` and `USERNAME/PASSWORD` is supported, command `CONNECT` is supported.
 
-### Examples
+### Server
 
-#### Run server without any authorization
+#### 1. Run server without any authorization
 
 ```rust
 use dlzht_socks5::server::SocksServerBuilder;
@@ -16,7 +16,7 @@ async fn main() {
 }
 ```
 
-#### Run server with password authorization
+#### 2. Run server with password authorization
 
 ```rust
 use dlzht_socks5::server::SocksServerBuilder;
@@ -30,7 +30,7 @@ async fn main() {
 }
 ```
 
-### Run server with handshake timeout
+#### 3. Run server with handshake timeout
 
 ```rust
 use std::time::Duration;
@@ -46,7 +46,7 @@ async fn main() {
 }
 ```
 
-### Custom validate username/password
+#### 4. Custom validate username/password
 
 ```rust
 use async_trait::async_trait;
@@ -78,8 +78,9 @@ impl Database {
   }
 }
 ```
+### Client
 
-### Run client without any authorization
+#### 1. Run client without any authorization
 
 ```rust
 use dlzht_socks5::client::SocksClientBuilder;
@@ -100,7 +101,7 @@ async fn main() {
 }
 ```
 
-#### Run client with password authorization
+#### 2. Run client with password authorization
 
 ```rust
 use dlzht_socks5::client::SocksClientBuilder;
@@ -121,7 +122,7 @@ async fn main() {
 }
 ```
 
-### Run client with handshake timeout
+#### 3. Run client with handshake timeout
 
 ```rust
 use dlzht_socks5::client::SocksClientBuilder;
