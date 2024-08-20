@@ -41,6 +41,31 @@
 //! }
 //! ```
 
+//! ### Run client with handshake timeout
+//!
+//! ```
+//! use dlzht_socks5::client::SocksClientBuilder;
+//! use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     use std::time::Duration;
+//! let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080));
+//!     let mut client = SocksClientBuilder::new()
+//!         .server_address(address)
+//!         .allow_auth_skip(true)
+//!         .handshake_timeout(Duration::from_secs(1))
+//!         .build()
+//!         .unwrap();
+//!     let mut stream = client
+//!         .connect(("127.0.0.1".to_string(), 9000))
+//!         .await
+//!         .unwrap();
+//! }
+//! ```
+//! Default handshake timeout is 10 minutes, which almost means no timeout configured.
+//!
+
 use crate::errors::{BuildSocksKind, ExecuteCmdKind, SocksError, SocksResult};
 use crate::package::{
     read_package, write_package, AuthMethodsPackage, AuthSelectPackage, PasswordReqPackage,
@@ -48,17 +73,19 @@ use crate::package::{
 };
 use crate::{
     is_invalid_password, is_invalid_username, AuthMethod, AuthMethods, PrivateStruct, RepliesRep,
-    RequestCmd, ToSocksAddress, DEFAULT_SERVER_ADDR,
+    RequestCmd, ToSocksAddress, DEFAULT_SERVER_ADDR, DEFAULT_TIMEOUT,
 };
 use bytes::{Bytes, BytesMut};
 use std::net::SocketAddr;
+use std::time::Duration;
 use tokio::net::TcpStream;
-use tracing::error;
+use tracing::{error, trace};
 
 pub struct SocksClientBuilder {
     server_address: SocketAddr,
     allow_auth_skip: bool,
     allow_auth_pass: bool,
+    handshake_timeout: Duration,
     username: Option<Bytes>,
     password: Option<Bytes>,
     _private: PrivateStruct,
@@ -70,6 +97,7 @@ impl SocksClientBuilder {
             server_address: DEFAULT_SERVER_ADDR,
             allow_auth_skip: true,
             allow_auth_pass: false,
+            handshake_timeout: DEFAULT_TIMEOUT,
             username: None,
             password: None,
             _private: PrivateStruct,
@@ -93,11 +121,17 @@ impl SocksClientBuilder {
         self
     }
 
+    pub fn handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
+    }
+
     pub fn build(self) -> SocksResult<SocksClient> {
         let SocksClientBuilder {
             server_address,
             allow_auth_skip,
             allow_auth_pass,
+            handshake_timeout,
             username,
             password,
             _private,
@@ -135,6 +169,7 @@ impl SocksClientBuilder {
         let client = SocksClient {
             server_addr: server_address,
             auth_methods: methods,
+            handshake_timeout,
             username,
             password,
             _private: PrivateStruct,
@@ -146,6 +181,7 @@ impl SocksClientBuilder {
 pub struct SocksClient {
     server_addr: SocketAddr,
     auth_methods: AuthMethods,
+    handshake_timeout: Duration,
     username: Option<Bytes>,
     password: Option<Bytes>,
     _private: PrivateStruct,
@@ -153,8 +189,20 @@ pub struct SocksClient {
 
 impl SocksClient {
     pub async fn connect(&mut self, addr: impl ToSocksAddress) -> SocksResult<TcpStream> {
-        let connection = self.handshake(addr, RequestCmd::CONNECT).await?;
+        let connection = self
+            .handshake_timeout(addr, RequestCmd::CONNECT, self.handshake_timeout)
+            .await?;
         return Ok(connection.proxy_stream);
+    }
+
+    async fn handshake_timeout(
+        &mut self,
+        addr: impl ToSocksAddress,
+        cmd: RequestCmd,
+        timeout: Duration,
+    ) -> SocksResult<ClientConnection> {
+        trace!("client handshake timeout: {:?}", timeout);
+        return tokio::time::timeout(timeout, self.handshake(addr, cmd)).await?;
     }
 
     async fn handshake(
@@ -166,7 +214,7 @@ impl SocksClient {
         let local_addr = stream.local_addr()?;
         let peer_addr = stream.peer_addr()?;
 
-        let mut buffer = BytesMut::with_capacity(512);
+        let mut buffer = BytesMut::with_capacity(64);
 
         let methods_pac = AuthMethodsPackage::new(self.auth_methods.clone());
         write_package(&methods_pac, &mut buffer, &mut stream).await?;

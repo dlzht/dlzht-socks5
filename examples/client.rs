@@ -1,7 +1,7 @@
 // use bytes::BytesMut;
+use bytes::BytesMut;
 use dlzht_socks5::client::SocksClientBuilder;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::main]
@@ -9,7 +9,8 @@ async fn main() {
     let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080));
     let mut client = SocksClientBuilder::new()
         .server_address(address)
-        .credential()
+        .allow_auth_skip(true)
+        .credential(b"username", b"password")
         .build()
         .unwrap();
     let mut stream = client

@@ -4,7 +4,11 @@ use std::fmt::{Display, Formatter};
 
 #[derive(Debug)]
 pub enum SocksError {
+    /// General io error, e.g. listen, connect
     StdIoError(std::io::Error),
+
+    /// General timeout error, e.g. handshake
+    TimeoutErr,
 
     /// Parse SOCKS5 protocol error
     InvalidPackageErr(InvalidPackageKind),
@@ -104,6 +108,12 @@ impl From<std::string::FromUtf8Error> for SocksError {
         return SocksError::InvalidPackageErr(InvalidPackageKind::InvalidDomainAddress(
             error.into_bytes(),
         ));
+    }
+}
+
+impl From<tokio::time::error::Elapsed> for SocksError {
+    fn from(_value: tokio::time::error::Elapsed) -> Self {
+        return SocksError::TimeoutErr;
     }
 }
 

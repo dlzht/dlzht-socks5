@@ -38,6 +38,24 @@
 //! If we hava multiple username/password, then we can invoke `credential(...)` repeatedly,
 //! or invoke `credentials(...)` for convenience.
 //!
+//! ### Run server with handshake timeout
+//!
+//! ```
+//! use std::time::Duration;
+//! use dlzht_socks5::server::SocksServerBuilder;
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     let server = SocksServerBuilder::new()
+//!         .allow_auth_skip(true)
+//!         .handshake_timeout(Duration::from_secs(1))
+//!         .build().unwrap();
+//!     let _ = server.start().await;
+//! }
+//! ```
+//!
+//! Default handshake timeout is 10 minutes, which almost means no timeout configured.
+//!
 //! ### Custom validate username/password
 //!
 //! Will support soon
@@ -49,7 +67,7 @@ use crate::package::{
 };
 use crate::{
     is_invalid_password, is_invalid_username, AuthMethod, AuthMethods, PrivateStruct, RepliesRep,
-    RequestCmd, SocksAddr, DEFAULT_SERVER_ADDR,
+    RequestCmd, SocksAddr, DEFAULT_SERVER_ADDR, DEFAULT_TIMEOUT,
 };
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -57,14 +75,15 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, warn};
+use tracing::{debug, error, trace, warn};
 
 pub struct SocksServerBuilder {
     server_address: SocketAddr,
     allow_auth_skip: bool,
     allow_auth_pass: bool,
+    handshake_timeout: Duration,
     memory_auth_pass: HashMap<Bytes, Bytes>,
     custom_auth_pass: Option<Box<dyn PasswordAuthority>>,
     _private: PrivateStruct,
@@ -76,6 +95,7 @@ impl SocksServerBuilder {
             server_address: DEFAULT_SERVER_ADDR,
             allow_auth_skip: false,
             allow_auth_pass: false,
+            handshake_timeout: DEFAULT_TIMEOUT,
             memory_auth_pass: Default::default(),
             custom_auth_pass: None,
             _private: PrivateStruct,
@@ -94,6 +114,11 @@ impl SocksServerBuilder {
 
     pub fn allow_auth_pass(mut self, allow: bool) -> Self {
         self.allow_auth_pass = allow;
+        self
+    }
+
+    pub fn handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
         self
     }
 
@@ -122,6 +147,7 @@ impl SocksServerBuilder {
             server_address: address,
             allow_auth_skip,
             allow_auth_pass,
+            handshake_timeout,
             memory_auth_pass,
             custom_auth_pass,
             _private,
@@ -145,13 +171,13 @@ impl SocksServerBuilder {
                 ));
             }
         }
-
         let authority = DefaultAuthority::new(memory_auth_pass);
 
         let server = SocksServer {
             address,
             allow_auth_skip,
             allow_auth_pass,
+            handshake_timeout,
             memory_auth_pass: authority,
             custom_auth_pass,
             _private: PrivateStruct,
@@ -164,6 +190,7 @@ pub struct SocksServer {
     address: SocketAddr,
     allow_auth_skip: bool,
     allow_auth_pass: bool,
+    handshake_timeout: Duration,
     memory_auth_pass: DefaultAuthority,
     custom_auth_pass: Option<Box<dyn PasswordAuthority>>,
     _private: PrivateStruct,
@@ -181,13 +208,14 @@ impl SocksServer {
                 Ok((stream, addr)) => {
                     debug!("accept success: {}", addr);
                     let server = server.clone();
+                    let timeout = server.handshake_timeout.clone();
                     tokio::spawn(async move {
-                        match server.handshake(stream, addr).await {
+                        match server.handshake_timeout(stream, timeout).await {
                             Ok(mut connection) => {
                                 let _ = connection.transfer().await;
                             }
                             Err(err) => {
-                                warn!("socks handshake error: {}", err);
+                                warn!("socks handshake error: {} {}", addr, err);
                             }
                         }
                     });
@@ -196,55 +224,37 @@ impl SocksServer {
         }
     }
 
-    async fn handshake(
+    async fn handshake_timeout(
         &self,
-        mut stream: TcpStream,
-        peer_addr: SocketAddr,
+        stream: TcpStream,
+        timeout: Duration,
     ) -> SocksResult<ServerConnection> {
-        let local_addr = stream.local_addr()?;
-        let mut buffer = BytesMut::with_capacity(512);
-
-        return match self.inner_handshake(&mut buffer, &mut stream).await {
-            Ok((identifier, method, target_stream)) => {
-                let connection = ServerConnection {
-                    identifier,
-                    local_addr,
-                    peer_addr,
-                    auth_method: method,
-                    proxy_stream: stream,
-                    target_stream,
-                };
-                Ok(connection)
-            }
-            Err(err) => {
-                let _ = stream.shutdown().await;
-                Err(err)
-            }
-        };
+        trace!("server handshake timeout: {:?}", timeout);
+        return tokio::time::timeout(timeout, self.handshake(stream)).await?;
     }
 
-    async fn inner_handshake(
-        &self,
-        buffer: &mut BytesMut,
-        stream: &mut TcpStream,
-    ) -> SocksResult<(u64, AuthMethod, TcpStream)> {
-        let auth_methods_pac: AuthMethodsPackage = read_package(buffer, stream).await?;
+    async fn handshake(&self, mut stream: TcpStream) -> SocksResult<ServerConnection> {
+        let local_addr = stream.local_addr()?;
+        let peer_addr = stream.peer_addr()?;
+        let mut buffer = BytesMut::with_capacity(64);
 
-        let method = self
+        let auth_methods_pac: AuthMethodsPackage = read_package(&mut buffer, &mut stream).await?;
+        let auth_method = self
             .select_auth_method(auth_methods_pac.methods_ref())
             .unwrap_or(AuthMethod::FAIL);
-        if method == AuthMethod::FAIL {
+        if auth_method == AuthMethod::FAIL {
             let auth_select_pac = AuthSelectPackage::new(AuthMethod::FAIL);
-            write_package(&auth_select_pac, buffer, stream).await?;
+            write_package(&auth_select_pac, &mut buffer, &mut stream).await?;
             return Err(SocksError::UnsupportedAuthMethod);
         }
 
-        let auth_select_pac = AuthSelectPackage::new(method);
-        write_package(&auth_select_pac, buffer, stream).await?;
+        let auth_select_pac = AuthSelectPackage::new(auth_method);
+        write_package(&auth_select_pac, &mut buffer, &mut stream).await?;
 
         let mut identifier = 0;
-        if method == AuthMethod::PASS {
-            let password_req_pac: PasswordReqPackage = read_package(buffer, stream).await?;
+        if auth_method == AuthMethod::PASS {
+            let password_req_pac: PasswordReqPackage =
+                read_package(&mut buffer, &mut stream).await?;
             let authed = self
                 .process_pass_auth(
                     password_req_pac.username_ref(),
@@ -253,15 +263,15 @@ impl SocksServer {
                 .await;
             if authed.is_none() {
                 let password_res_pac = PasswordResPackage::new(false);
-                write_package(&password_res_pac, buffer, stream).await?;
+                write_package(&password_res_pac, &mut buffer, &mut stream).await?;
                 return Err(SocksError::PasswordAuthNotPassed);
             }
             identifier = authed.unwrap_or(0);
             let password_res_pac = PasswordResPackage::new(true);
-            write_package(&password_res_pac, buffer, stream).await?;
+            write_package(&password_res_pac, &mut buffer, &mut stream).await?;
         }
 
-        let requests_pac: RequestsPackage = match read_package(buffer, stream).await {
+        let requests_pac: RequestsPackage = match read_package(&mut buffer, &mut stream).await {
             Ok(pac) => pac,
             Err(err) => {
                 if matches!(
@@ -272,7 +282,7 @@ impl SocksServer {
                         RepliesRep::COMMAND_NOT_SUPPORTED,
                         SocksAddr::UNSPECIFIED_ADDR,
                     );
-                    write_package(&replies_pac, buffer, stream).await?;
+                    write_package(&replies_pac, &mut buffer, &mut stream).await?;
                 }
                 return Err(err);
             }
@@ -282,7 +292,7 @@ impl SocksServer {
                 RepliesRep::COMMAND_NOT_SUPPORTED,
                 SocksAddr::UNSPECIFIED_ADDR,
             );
-            write_package(&replies_pac, buffer, stream).await?;
+            write_package(&replies_pac, &mut buffer, &mut stream).await?;
             return Err(SocksError::UnsupportedCommand(
                 requests_pac.cmd_ref().to_byte(),
             ));
@@ -291,7 +301,7 @@ impl SocksServer {
             Ok(stream) => stream,
             Err(SocksError::ExecuteCommandErr(ExecuteCmdKind::Server(err))) => {
                 let replies_pac = RepliesPackage::new((&err).into(), SocksAddr::UNSPECIFIED_ADDR);
-                write_package(&replies_pac, buffer, stream).await?;
+                write_package(&replies_pac, &mut buffer, &mut stream).await?;
                 return Err(SocksError::ExecuteCommandErr(ExecuteCmdKind::Server(err)));
             }
             Err(err) => {
@@ -299,8 +309,17 @@ impl SocksServer {
             }
         };
         let replies_pac = RepliesPackage::new(RepliesRep::SUCCESS, SocksAddr::UNSPECIFIED_ADDR);
-        write_package(&replies_pac, buffer, stream).await?;
-        return Ok((identifier, method, target_stream));
+        write_package(&replies_pac, &mut buffer, &mut stream).await?;
+
+        let connection = ServerConnection {
+            identifier,
+            local_addr,
+            peer_addr,
+            auth_method,
+            proxy_stream: stream,
+            target_stream,
+        };
+        return Ok(connection);
     }
 
     fn select_auth_method(&self, methods: &AuthMethods) -> Option<AuthMethod> {

@@ -38,6 +38,24 @@
 //! If we hava multiple username/password, then we can invoke `credential(...)` repeatedly,
 //! or invoke `credentials(...)` for convenience.
 //!
+//! ### Run server with handshake timeout
+//!
+//! ```
+//! use std::time::Duration;
+//! use dlzht_socks5::server::SocksServerBuilder;
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     let server = SocksServerBuilder::new()
+//!         .allow_auth_skip(true)
+//!         .handshake_timeout(Duration::from_secs(1))
+//!         .build().unwrap();
+//!     let _ = server.start().await;
+//! }
+//! ```
+//!
+//! Default handshake timeout is 10 minutes, which almost means no timeout configured.
+//!
 //! ### Custom validate username/password
 //!
 //! Will support soon
@@ -86,6 +104,7 @@
 use crate::errors::{InvalidPackageKind, SocksError, SocksResult};
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::time::Duration;
 
 pub(crate) const SOCKS5_RSV_BYTE: u8 = 0x00;
 pub(crate) const SOCKS5_VERSION: u8 = 0x05;
@@ -93,6 +112,7 @@ pub(crate) const SUB_NEG_VERSION: u8 = 0x01;
 
 pub(crate) const DEFAULT_SERVER_ADDR: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct PrivateStruct;
