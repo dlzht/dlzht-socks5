@@ -1,5 +1,5 @@
 #![feature(io_error_more)]
-
+#![feature(let_chains)]
 //! ### Run server without any authorization
 //!
 //! ```
@@ -235,7 +235,7 @@ impl AuthMethods {
 pub(crate) struct RequestCmd(u8);
 
 impl RequestCmd {
-  pub const CONNECT: RequestCmd = RequestCmd(0x01);
+  pub const TCP: RequestCmd = RequestCmd(0x01);
   pub const BIND: RequestCmd = RequestCmd(0x02);
   pub const UDP: RequestCmd = RequestCmd(0x03);
 }
@@ -243,7 +243,7 @@ impl RequestCmd {
 impl RequestCmd {
   fn from_byte(byte: u8) -> SocksResult<RequestCmd> {
     match byte {
-      0x01 => Ok(RequestCmd::CONNECT),
+      0x01 => Ok(RequestCmd::TCP),
       0x02 => Ok(RequestCmd::BIND),
       0x03 => Ok(RequestCmd::UDP),
       _ => Err(SocksError::InvalidPackageErr(

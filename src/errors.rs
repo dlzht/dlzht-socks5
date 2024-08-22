@@ -30,6 +30,7 @@ pub enum SocksError {
 
   /// Build SOCKS5 client error
   BuildSocksClientErr(BuildSocksKind),
+
 }
 
 /// Errors that can occur parsing SOCKS5 protocol.
@@ -64,6 +65,9 @@ pub enum InvalidPackageKind {
 
   /// Domain name is not valid UFT8 string
   InvalidDomainAddress(Vec<u8>),
+
+  /// Invalid UDP requests
+  InvalidUdpRequests,
 }
 
 /// Errors of building SOCKS5 client or server

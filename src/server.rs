@@ -77,7 +77,7 @@
 //! #[async_trait]
 //! impl PasswordAuthority for DatabaseAuthority {
 //!   async fn auth(&self, username: &[u8], password: &[u8]) -> Option<u64> {
-//!     return self.database.select("SELECT id FROM account WHERE username = #{username} AND password = #{password}")
+//!     return self.database.select("SELECT id FROM account WHERE username = #{username} AND password = #{password}");
 //!   }
 //! }
 //!
@@ -89,14 +89,10 @@
 //! }
 //! ```
 
-
-use crate::errors::{BuildSocksKind, ExecuteCmdKind, InvalidPackageKind, SocksError, SocksResult};
-use crate::package::{
-  read_package, write_package, AuthMethodsPackage, AuthSelectPackage, PasswordReqPackage,
-  PasswordResPackage, RepliesPackage, RequestsPackage,
-};
+use crate::errors::{BuildSocksKind, ExecuteCmdKind, SocksError, SocksResult};
+use crate::package::{read_package, write_package, AuthMethodsPackage, AuthSelectPackage, PasswordReqPackage, PasswordResPackage, RepliesPackage, RequestsPackage, UdpRequestsPackage};
 use crate::{
-  is_invalid_password, is_invalid_username, AuthMethod, AuthMethods, PrivateStruct, RepliesRep,
+  is_invalid_password, is_invalid_username, AuthMethod, PrivateStruct, RepliesRep,
   RequestCmd, SocksAddr, DEFAULT_SERVER_ADDR, DEFAULT_TIMEOUT,
 };
 use async_trait::async_trait;
@@ -106,11 +102,16 @@ use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::RwLock;
+use tokio::time::Instant;
 use tracing::{debug, error, trace, warn};
 
 pub struct SocksServerBuilder {
-  server_address: SocketAddr,
+  tcp_listen_addr: SocketAddr,
+  tcp_reply_addr: SocketAddr,
+  udp_listen_addr: Option<SocketAddr>,
+  udp_reply_addr: Option<SocketAddr>,
   allow_auth_skip: bool,
   allow_auth_pass: bool,
   handshake_timeout: Duration,
@@ -122,7 +123,10 @@ pub struct SocksServerBuilder {
 impl SocksServerBuilder {
   pub fn new() -> SocksServerBuilder {
     return SocksServerBuilder {
-      server_address: DEFAULT_SERVER_ADDR,
+      tcp_listen_addr: DEFAULT_SERVER_ADDR,
+      tcp_reply_addr: DEFAULT_SERVER_ADDR,
+      udp_listen_addr: None,
+      udp_reply_addr: None,
       allow_auth_skip: false,
       allow_auth_pass: false,
       handshake_timeout: DEFAULT_TIMEOUT,
@@ -132,10 +136,27 @@ impl SocksServerBuilder {
     };
   }
 
-  pub fn server_address(mut self, address: SocketAddr) -> Self {
-    self.server_address = address;
+  pub fn tcp_listen_addr(mut self, address: SocketAddr) -> Self {
+    self.tcp_listen_addr = address;
+    self.tcp_reply_addr = address;
     self
   }
+
+  // pub fn tcp_reply_addr(mut self, address: SocketAddr) -> Self {
+  //   self.tcp_reply_addr = address;
+  //   self
+  // }
+
+  // pub fn udp_listen_addr(mut self, address: SocketAddr) -> Self {
+  //   self.udp_listen_addr = Some(address);
+  //   self.udp_reply_addr = Some(address);
+  //   self
+  // }
+
+  // pub fn udp_reply_addr(mut self, address: SocketAddr) -> Self {
+  //   self.udp_reply_addr = Some(address);
+  //   self
+  // }
 
   pub fn allow_auth_skip(mut self, allow: bool) -> Self {
     self.allow_auth_skip = allow;
@@ -175,7 +196,10 @@ impl SocksServerBuilder {
 
   pub fn build(self) -> SocksResult<SocksServer> {
     let SocksServerBuilder {
-      server_address: address,
+      tcp_listen_addr: address,
+      tcp_reply_addr,
+      udp_listen_addr,
+      udp_reply_addr,
       allow_auth_skip,
       allow_auth_pass,
       handshake_timeout,
@@ -202,14 +226,16 @@ impl SocksServerBuilder {
         ));
       }
     }
-    let authority = DefaultAuthority::new(memory_auth_pass);
-
     let server = SocksServer {
-      address,
+      tcp_listen_addr: address,
+      tcp_reply_addr,
+      udp_listen_addr,
+      udp_reply_addr,
+      udp_socket_map: RwLock::new(UdpSocketMap::default()),
       allow_auth_skip,
       allow_auth_pass,
       handshake_timeout,
-      memory_auth_pass: authority,
+      memory_auth_pass: DefaultAuthority::new(memory_auth_pass),
       custom_auth_pass,
       _private: PrivateStruct,
     };
@@ -218,7 +244,11 @@ impl SocksServerBuilder {
 }
 
 pub struct SocksServer {
-  address: SocketAddr,
+  tcp_listen_addr: SocketAddr,
+  tcp_reply_addr: SocketAddr,
+  udp_listen_addr: Option<SocketAddr>,
+  udp_reply_addr: Option<SocketAddr>,
+  udp_socket_map: RwLock<UdpSocketMap>,
   allow_auth_skip: bool,
   allow_auth_pass: bool,
   handshake_timeout: Duration,
@@ -227,117 +257,110 @@ pub struct SocksServer {
   _private: PrivateStruct,
 }
 
+async fn handle_tcp(server: Arc<SocksServer>) -> SocksResult<()> {
+  let listener = TcpListener::bind(server.tcp_listen_addr).await?;
+  loop {
+    match listener.accept().await {
+      Ok((stream, addr)) => {
+        debug!("accept success: {}", addr);
+        let server = server.clone();
+        let timeout = server.handshake_timeout.clone();
+        tokio::spawn(async move {
+          let _ = server.handle_tcp_connection(addr, stream, timeout).await;
+        });
+      }
+      Err(err) => {
+        warn!("accept error: {}", err);
+      }
+    }
+  }
+}
+
+async fn handle_udp(server: Arc<SocksServer>) -> SocksResult<()> {
+  if server.udp_listen_addr.is_none() {
+    return Ok(());
+  }
+  let mut peek_buf = BytesMut::with_capacity(16);
+  let listen_addr = server.udp_listen_addr.unwrap();
+  let socket = UdpSocket::bind(listen_addr).await?;
+  loop {
+    let (size, _addr) = socket.peek_from(&mut peek_buf).await?;
+    let mut send_buf = BytesMut::with_capacity(size);
+    match socket.recv_buf_from(&mut send_buf).await {
+      Ok((_size, _addr)) => {
+        match UdpRequestsPackage::read(send_buf) {
+          Ok(pac) => {
+            let target_addr = pac.addr_ref();
+            let send_data = pac.data_ref();
+            let _send_res = match target_addr {
+              SocksAddr::IPV4(ipv4) => socket.send_to(send_data, ipv4).await,
+              SocksAddr::IPV6(ipv6) => socket.send_to(send_data, ipv6).await,
+              SocksAddr::Domain(domain, port) => socket.send_to(send_data, (domain.as_str(), *port)).await
+            };
+          }
+          Err(err) => {
+            error!("handle udp package error: {}", err);
+          }
+        }
+      }
+      Err(_) => {}
+    }
+  }
+}
+
 impl SocksServer {
   pub async fn start(self) -> SocksResult<()> {
-    let listener = TcpListener::bind(self.address).await?;
     let server = Arc::new(self);
-    loop {
-      match listener.accept().await {
-        Err(err) => {
-          warn!("accept error: {}", err);
-        }
-        Ok((stream, addr)) => {
-          debug!("accept success: {}", addr);
-          let server = server.clone();
-          let timeout = server.handshake_timeout.clone();
-          tokio::spawn(async move {
-            match server.handshake_timeout(stream, timeout).await {
-              Ok(mut connection) => {
-                let _ = connection.transfer().await;
-              }
-              Err(err) => {
-                warn!("socks handshake error: {} {}", addr, err);
-              }
-            }
-          });
-        }
+
+    if server.udp_listen_addr.is_some() {
+      let udp_server = server.clone();
+      tokio::spawn(async move {
+        let _ = handle_udp(udp_server).await;
+      });
+    }
+
+    let tcp_server = server.clone();
+    let _ = handle_tcp(tcp_server).await;
+
+    return Ok(());
+  }
+
+  async fn handle_tcp_connection(&self, addr: SocketAddr, stream: TcpStream, timeout: Duration) {
+    match self.handshake_with_timeout(stream, timeout).await {
+      Ok(mut connection) => {
+        let _ = connection.transfer().await;
+      }
+      Err(err) => {
+        warn!("socks handshake error: {} {}", addr, err);
       }
     }
   }
 
-  async fn handshake_timeout(
+  async fn handshake_with_timeout(
     &self,
     stream: TcpStream,
     timeout: Duration,
   ) -> SocksResult<ServerConnection> {
     trace!("server handshake timeout: {:?}", timeout);
-    return tokio::time::timeout(timeout, self.handshake(stream)).await?;
+    return tokio::time::timeout(timeout, self.handshake_without_timeout(stream)).await?;
   }
 
-  async fn handshake(&self, mut stream: TcpStream) -> SocksResult<ServerConnection> {
+  async fn handshake_without_timeout(
+    &self,
+    mut stream: TcpStream,
+  ) -> SocksResult<ServerConnection> {
     let local_addr = stream.local_addr()?;
     let peer_addr = stream.peer_addr()?;
     let mut buffer = BytesMut::with_capacity(64);
 
-    let auth_methods_pac: AuthMethodsPackage = read_package(&mut buffer, &mut stream).await?;
-    let auth_method = self
-      .select_auth_method(auth_methods_pac.methods_ref())
-      .unwrap_or(AuthMethod::FAIL);
-    if auth_method == AuthMethod::FAIL {
-      let auth_select_pac = AuthSelectPackage::new(AuthMethod::FAIL);
-      write_package(&auth_select_pac, &mut buffer, &mut stream).await?;
-      return Err(SocksError::UnsupportedAuthMethod);
-    }
-
-    let auth_select_pac = AuthSelectPackage::new(auth_method);
-    write_package(&auth_select_pac, &mut buffer, &mut stream).await?;
-
+    let auth_method = self.handle_select_method(&mut buffer, &mut stream).await?;
     let mut identifier = 0;
     if auth_method == AuthMethod::PASS {
-      let password_req_pac: PasswordReqPackage = read_package(&mut buffer, &mut stream).await?;
-      let authed = self
-        .process_pass_auth(
-          password_req_pac.username_ref(),
-          password_req_pac.password_ref(),
-        )
-        .await;
-      if authed.is_none() {
-        let password_res_pac = PasswordResPackage::new(false);
-        write_package(&password_res_pac, &mut buffer, &mut stream).await?;
-        return Err(SocksError::PasswordAuthNotPassed);
-      }
-      identifier = authed.unwrap_or(0);
-      let password_res_pac = PasswordResPackage::new(true);
-      write_package(&password_res_pac, &mut buffer, &mut stream).await?;
+      identifier = self.handle_password_auth(&mut buffer, &mut stream).await?;
     }
+    let (command, addr) = self.handle_receive_requests(&mut buffer, &mut stream).await?;
+    let source_stream = self.handle_execute_command(command, addr, &mut buffer, &mut stream).await?;
 
-    let requests_pac: RequestsPackage = match read_package(&mut buffer, &mut stream).await {
-      Ok(pac) => pac,
-      Err(err) => {
-        if matches!(
-          err,
-          SocksError::InvalidPackageErr(InvalidPackageKind::InvalidRequestsCmd(_))
-        ) {
-          let replies_pac = RepliesPackage::new(
-            RepliesRep::COMMAND_NOT_SUPPORTED,
-            SocksAddr::UNSPECIFIED_ADDR,
-          );
-          write_package(&replies_pac, &mut buffer, &mut stream).await?;
-        }
-        return Err(err);
-      }
-    };
-    if &RequestCmd::CONNECT != requests_pac.cmd_ref() {
-      let replies_pac = RepliesPackage::new(
-        RepliesRep::COMMAND_NOT_SUPPORTED,
-        SocksAddr::UNSPECIFIED_ADDR,
-      );
-      write_package(&replies_pac, &mut buffer, &mut stream).await?;
-      return Err(SocksError::UnsupportedCommand(
-        requests_pac.cmd_ref().to_byte(),
-      ));
-    }
-    let target_stream = match self.connect_target_peer(requests_pac.addr_ref()).await {
-      Ok(stream) => stream,
-      Err(SocksError::ExecuteCommandErr(ExecuteCmdKind::Server(err))) => {
-        let replies_pac = RepliesPackage::new((&err).into(), SocksAddr::UNSPECIFIED_ADDR);
-        write_package(&replies_pac, &mut buffer, &mut stream).await?;
-        return Err(SocksError::ExecuteCommandErr(ExecuteCmdKind::Server(err)));
-      }
-      Err(err) => {
-        return Err(err);
-      }
-    };
     let replies_pac = RepliesPackage::new(RepliesRep::SUCCESS, SocksAddr::UNSPECIFIED_ADDR);
     write_package(&replies_pac, &mut buffer, &mut stream).await?;
 
@@ -346,34 +369,90 @@ impl SocksServer {
       local_addr,
       peer_addr,
       auth_method,
-      proxy_stream: stream,
-      target_stream,
+      source_stream,
+      target_stream: SocksStream::TCP(stream),
     };
     return Ok(connection);
   }
 
-  fn select_auth_method(&self, methods: &AuthMethods) -> Option<AuthMethod> {
-    if self.allow_auth_skip && methods.contains(&AuthMethod::SKIP) {
-      return Some(AuthMethod::SKIP);
-    }
-    if self.allow_auth_pass && methods.contains(&AuthMethod::PASS) {
-      return Some(AuthMethod::PASS);
-    }
-    return None;
-  }
-
-  async fn process_pass_auth(&self, username: &[u8], password: &[u8]) -> Option<u64> {
-    let res = self.memory_auth_pass.auth(username, password).await;
-    if res.is_some() {
-      return res;
-    }
-    return match &self.custom_auth_pass {
-      None => None,
-      Some(authority) => authority.auth(username, password).await,
+  async fn handle_select_method(&self, buffer: &mut BytesMut, stream: &mut TcpStream) -> SocksResult<AuthMethod> {
+    let auth_methods_pac = read_package::<_, AuthMethodsPackage>(buffer, stream).await?;
+    let auth_methods = auth_methods_pac.methods_ref();
+    let auth_method = if self.allow_auth_skip && auth_methods.contains(&AuthMethod::SKIP) {
+      AuthMethod::SKIP
+    } else if self.allow_auth_pass && auth_methods.contains(&AuthMethod::PASS) {
+      AuthMethod::PASS
+    } else {
+      AuthMethod::FAIL
     };
+    if auth_method == AuthMethod::FAIL {
+      let auth_select_pac = AuthSelectPackage::new(AuthMethod::FAIL);
+      write_package(&auth_select_pac, buffer, stream).await?;
+      return Err(SocksError::UnsupportedAuthMethod);
+    }
+    let auth_select_pac = AuthSelectPackage::new(auth_method);
+    write_package(&auth_select_pac, buffer, stream).await?;
+    return Ok(auth_method);
   }
 
-  async fn connect_target_peer(&self, addr: &SocksAddr) -> SocksResult<TcpStream> {
+  async fn handle_password_auth(&self, buffer: &mut BytesMut, stream: &mut TcpStream) -> SocksResult<u64> {
+    let PasswordReqPackage { username, password } = read_package::<_, PasswordReqPackage>(buffer, stream).await?;
+    let mut identifier = self.memory_auth_pass.auth(username.as_ref(), password.as_ref()).await;
+    if let Some(authority) = &self.custom_auth_pass && identifier.is_none() {
+      identifier = authority.auth(username.as_ref(), password.as_ref()).await;
+    }
+    if identifier.is_none() {
+      let password_res_pac = PasswordResPackage::new(false);
+      write_package(&password_res_pac, buffer, stream).await?;
+      return Err(SocksError::PasswordAuthNotPassed);
+    }
+    let password_res_pac = PasswordResPackage::new(true);
+    write_package(&password_res_pac, buffer, stream).await?;
+    return Ok(identifier.unwrap_or(0));
+  }
+
+  async fn handle_receive_requests(&self, buffer: &mut BytesMut, stream: &mut TcpStream) -> SocksResult<(RequestCmd, SocksAddr)> {
+    let requests_pac= read_package::<_, RequestsPackage>(buffer, stream).await?;
+    let RequestsPackage { cmd, addr } = requests_pac;
+    return Ok((cmd, addr));
+  }
+
+  async fn handle_execute_command(&self, cmd: RequestCmd, addr: SocksAddr, buffer: &mut BytesMut, stream: &mut TcpStream) -> SocksResult<SocksStream> {
+    if cmd == RequestCmd::TCP {
+      let stream = self.handle_command_tcp(&addr, buffer, stream).await?;
+      return Ok(SocksStream::TCP(stream));
+    }
+    if cmd == RequestCmd::UDP {
+      // return self.handle_command_udp(&addr, buffer, stream);
+    }
+    let replies_pac = RepliesPackage::new(
+      RepliesRep::COMMAND_NOT_SUPPORTED,
+      SocksAddr::UNSPECIFIED_ADDR,
+    );
+    write_package(&replies_pac, buffer, stream).await?;
+    return Err(SocksError::UnsupportedCommand(cmd.to_byte()));
+  }
+
+  async fn handle_command_tcp(&self, addr: &SocksAddr, buffer: &mut BytesMut, stream: &mut TcpStream) -> SocksResult<TcpStream> {
+    let target_stream = match self.connect_tcp_peer(&addr).await {
+      Ok(stream) => stream,
+      Err(SocksError::ExecuteCommandErr(ExecuteCmdKind::Server(err))) => {
+        let replies_pac = RepliesPackage::new((&err).into(), SocksAddr::UNSPECIFIED_ADDR);
+        write_package(&replies_pac, buffer, stream).await?;
+        return Err(SocksError::ExecuteCommandErr(ExecuteCmdKind::Server(err)));
+      }
+      Err(err) => {
+        return Err(err);
+      }
+    };
+    return Ok(target_stream);
+  }
+
+  async fn handle_command_udp(&self, _addr: &SocksAddr, _buffer: &mut BytesMut, _stream: &mut TcpStream) {
+    todo!()
+  }
+
+  async fn connect_tcp_peer(&self, addr: &SocksAddr) -> SocksResult<TcpStream> {
     let stream = match addr {
       SocksAddr::IPV4(ipv4) => TcpStream::connect(ipv4).await,
       SocksAddr::IPV6(ipv6) => TcpStream::connect(ipv6).await,
@@ -383,14 +462,13 @@ impl SocksServer {
   }
 }
 
-#[derive(Debug)]
 pub(crate) struct ServerConnection {
   identifier: u64,
   local_addr: SocketAddr,
   peer_addr: SocketAddr,
   auth_method: AuthMethod,
-  proxy_stream: TcpStream,
-  target_stream: TcpStream,
+  source_stream: SocksStream,
+  target_stream: SocksStream,
 }
 
 impl ServerConnection {
@@ -415,7 +493,14 @@ impl ServerConnection {
   }
 
   async fn transfer(&mut self) -> SocksResult<()> {
-    tokio::io::copy_bidirectional(&mut self.proxy_stream, &mut self.target_stream).await?;
+    match (&mut self.source_stream, &mut self.target_stream) {
+      (SocksStream::TCP(source), SocksStream::TCP(target)) => {
+        tokio::io::copy_bidirectional(source, target).await?;
+      }
+      _ => {
+        unimplemented!()
+      }
+    }
     return Ok(());
   }
 }
@@ -445,4 +530,31 @@ impl PasswordAuthority for DefaultAuthority {
       .unwrap_or(false);
     return if result { Some(1) } else { None };
   }
+}
+
+#[derive(Debug, Default)]
+struct UdpSocketMap {
+  addrs: HashMap<SocketAddr, (SocketAddr, Instant)>,
+}
+
+impl UdpSocketMap {
+  fn insert(&mut self, source: SocketAddr, target: SocketAddr) {
+    let instant = Instant::now();
+    let entry = self.addrs.entry(target)
+      .or_insert((source, instant));
+    entry.1 = instant;
+  }
+
+  fn query(&self, target: &SocketAddr) -> bool {
+    return self.addrs.contains_key(target);
+  }
+}
+
+struct UdpStream {
+  stream: UdpSocket,
+}
+
+enum SocksStream {
+  TCP(TcpStream),
+  UDP
 }

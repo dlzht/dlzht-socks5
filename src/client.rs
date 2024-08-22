@@ -190,7 +190,7 @@ pub struct SocksClient {
 impl SocksClient {
   pub async fn connect(&mut self, addr: impl ToSocksAddress) -> SocksResult<TcpStream> {
     let connection = self
-      .handshake_timeout(addr, RequestCmd::CONNECT, self.handshake_timeout)
+      .handshake_timeout(addr, RequestCmd::TCP, self.handshake_timeout)
       .await?;
     return Ok(connection.proxy_stream);
   }
@@ -219,7 +219,7 @@ impl SocksClient {
     let methods_pac = AuthMethodsPackage::new(self.auth_methods.clone());
     write_package(&methods_pac, &mut buffer, &mut stream).await?;
 
-    let select_pac: AuthSelectPackage = read_package(&mut buffer, &mut stream).await?;
+    let select_pac = read_package::<_, AuthSelectPackage>(&mut buffer, &mut stream).await?;
     let method = select_pac.auth_method();
     if !self.auth_methods.contains(&method) {
       return Err(SocksError::UnsupportedAuthMethod);
@@ -232,7 +232,7 @@ impl SocksClient {
       );
       write_package(&password_pac, &mut buffer, &mut stream).await?;
 
-      let password_pac: PasswordResPackage = read_package(&mut buffer, &mut stream).await?;
+      let password_pac = read_package::<_, PasswordResPackage>(&mut buffer, &mut stream).await?;
       if !password_pac.is_success() {
         return Err(SocksError::PasswordAuthNotPassed);
       }
@@ -240,7 +240,7 @@ impl SocksClient {
     let requests_pac = RequestsPackage::new(cmd, addr.to_socks_addr());
     write_package(&requests_pac, &mut buffer, &mut stream).await?;
 
-    let replies_pac: RepliesPackage = read_package(&mut buffer, &mut stream).await?;
+    let replies_pac = read_package::<_, RepliesPackage>(&mut buffer, &mut stream).await?;
     if !replies_pac.is_success() {
       let rep = RepliesRep::from_byte(replies_pac.req_ref().to_byte())?;
       error!("handshake replies error: {}", rep.message());

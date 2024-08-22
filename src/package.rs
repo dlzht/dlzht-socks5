@@ -16,6 +16,7 @@ pub(crate) enum ParseResult<T> {
   Complete(T),
 }
 
+
 pub(crate) trait SocksPackage: Sized + Debug {
   fn read(buffer: &mut BytesMut) -> SocksResult<ParseResult<Self>>;
   fn write(&self, buffer: &mut BytesMut);
@@ -123,8 +124,8 @@ impl SocksPackage for AuthSelectPackage {
 
 #[derive(Debug)]
 pub(crate) struct PasswordReqPackage {
-  username: Bytes,
-  password: Bytes,
+  pub(crate) username: Bytes,
+  pub(crate) password: Bytes,
 }
 
 impl PasswordReqPackage {
@@ -135,13 +136,6 @@ impl PasswordReqPackage {
     };
   }
 
-  pub fn username_ref(&self) -> &[u8] {
-    return self.username.as_ref();
-  }
-
-  pub fn password_ref(&self) -> &[u8] {
-    return self.password.as_ref();
-  }
 }
 
 impl SocksPackage for PasswordReqPackage {
@@ -238,22 +232,13 @@ impl SocksPackage for PasswordResPackage {
 
 #[derive(Debug)]
 pub(crate) struct RequestsPackage {
-  cmd: RequestCmd,
-  addr: SocksAddr,
+  pub(crate) cmd: RequestCmd,
+  pub(crate) addr: SocksAddr,
 }
 
 impl RequestsPackage {
   pub fn new(cmd: RequestCmd, addr: SocksAddr) -> RequestsPackage {
     return RequestsPackage { cmd, addr };
-  }
-
-  #[allow(dead_code)]
-  pub fn cmd_ref(&self) -> &RequestCmd {
-    return &self.cmd;
-  }
-
-  pub fn addr_ref(&self) -> &SocksAddr {
-    return &self.addr;
   }
 }
 
@@ -458,11 +443,59 @@ pub(crate) async fn write_package<W: AsyncWrite + Unpin>(
   return Ok(buffer.clear());
 }
 
+#[derive(Debug)]
+pub(crate) struct UdpRequestsPackage {
+  fragment: u8,
+  addr: SocksAddr,
+  data: Bytes
+}
+
+impl UdpRequestsPackage {
+  pub(crate) fn read(mut buffer: BytesMut) -> SocksResult<UdpRequestsPackage> {
+    let mut advance = 0;
+    let mut bytes = buffer.as_ref();
+    if bytes.remaining() < 4 {
+      return Err(SocksError::InvalidPackageErr(InvalidPackageKind::InvalidUdpRequests));
+    }
+    let rsv = bytes.get_u16();
+    if rsv != 0 {
+      let rsv = (rsv & 0xFF) as u8 | ((rsv >> 8) & 0xFF) as u8;
+      return Err(SocksError::InvalidPackageErr(InvalidPackageKind::InvalidSocks5RsvByte(rsv)));
+    }
+    advance += 3;
+    let fragment = bytes.get_u8();
+    let addr = match read_address(&mut bytes, &mut advance) {
+      Ok(ParseResult::Complete(addr)) => addr,
+      Ok(ParseResult::Partial) => {
+        return Err(SocksError::InvalidPackageErr(InvalidPackageKind::InvalidUdpRequests));
+      },
+      Err(err) => {
+        return Err(err);
+      }
+    };
+    buffer.advance(advance);
+    let package = UdpRequestsPackage {
+      fragment,
+      addr,
+      data: buffer.freeze()
+    };
+    return Ok(package);
+  }
+
+  pub(crate) fn data_ref(&self) -> &[u8] {
+    return self.data.as_ref();
+  }
+
+  pub(crate) fn addr_ref(&self) -> &SocksAddr {
+    return &self.addr;
+  }
+}
+
 #[cfg(test)]
 mod test {
   use crate::errors::SocksResult;
   use crate::package::{
-    read_address, read_package, write_package, AuthMethodsPackage, AuthSelectPackage, ParseResult,
+    read_package, AuthMethodsPackage, AuthSelectPackage, ParseResult,
     PasswordReqPackage, PasswordResPackage, RepliesPackage, RequestsPackage, SocksPackage,
   };
   use crate::{AuthMethod, AuthMethods, RepliesRep, RequestCmd, SocksAddr};
@@ -692,7 +725,7 @@ mod test {
   fn write_requests_package() {
     let mut buffer = BytesMut::with_capacity(32);
     let ipv4 = SocksAddr::IPV4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 3000));
-    let pac = RequestsPackage::new(RequestCmd::CONNECT, ipv4);
+    let pac = RequestsPackage::new(RequestCmd::TCP, ipv4);
     pac.write(&mut buffer);
     assert_eq!(
       buffer.as_ref(),
@@ -706,7 +739,7 @@ mod test {
       0,
       0,
     ));
-    let pac = RequestsPackage::new(RequestCmd::CONNECT, ipv6);
+    let pac = RequestsPackage::new(RequestCmd::TCP, ipv6);
     pac.write(&mut buffer);
     assert_eq!(
       buffer.as_ref(),
@@ -718,7 +751,7 @@ mod test {
 
     let mut buffer = BytesMut::with_capacity(32);
     let domain = SocksAddr::Domain("example.com".to_string(), 3000);
-    let pac = RequestsPackage::new(RequestCmd::CONNECT, domain);
+    let pac = RequestsPackage::new(RequestCmd::TCP, domain);
     pac.write(&mut buffer);
     assert_eq!(
       buffer.as_ref(),
@@ -824,7 +857,7 @@ mod test {
       .read(&[0x05, 0x01])
       .read(&[0x00])
       .build();
-    let pac: SocksResult<AuthMethodsPackage> = read_package(&mut buffer, &mut stream).await;
+    let pac = read_package::<_, AuthMethodsPackage>(&mut buffer, &mut stream).await;
     assert!(matches!(pac, Ok(AuthMethodsPackage { .. })));
   }
 }

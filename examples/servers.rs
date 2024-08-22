@@ -28,7 +28,7 @@ async fn main() {
 
   let mut builder = SocksServerBuilder::new()
     .allow_auth_skip(allow_auth_skip)
-    .server_address(SocketAddr::new(addr, port));
+    .tcp_listen_addr(SocketAddr::new(addr, port));
   if !username_password.is_empty() {
     builder = builder.credentials(username_password);
   }
